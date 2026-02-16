@@ -1,0 +1,207 @@
+require('dotenv').config();
+const express = require('express');
+const { Pool } = require('pg');
+const { v4: uuidv4 } = require('uuid');
+
+const app = express();
+app.use(express.json());
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+});
+
+const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN;
+
+// --- Auth Middleware ---
+app.use((req, res, next) => {
+  if (req.path.startsWith('/commands')) {
+    const auth = req.headers.authorization;
+    if (!auth || auth !== `Bearer ${INTERNAL_TOKEN}`) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+  }
+  next();
+});
+
+// --- POST /commands ---
+app.post('/commands', async (req, res) => {
+  const { command_id, type, payload } = req.body;
+
+  if (!command_id || !type) {
+    return res.status(400).json({ error: 'command_id and type required' });
+  }
+
+  const client = await pool.connect();
+  try {
+    const existing = await client.query(
+      'SELECT * FROM commands WHERE command_id = $1',
+      [command_id]
+    );
+
+    if (existing.rows.length > 0) {
+      return res.json(existing.rows[0]);
+    }
+
+    await client.query(
+      `INSERT INTO commands (command_id, type, payload_json, status)
+       VALUES ($1, $2, $3, 'PENDING')`,
+      [command_id, type, payload || {}]
+    );
+
+    const created = await client.query(
+      'SELECT * FROM commands WHERE command_id = $1',
+      [command_id]
+    );
+
+    res.json(created.rows[0]);
+  } finally {
+    client.release();
+  }
+});
+
+// --- GET /commands/:id ---
+// --- POST /commands/next ---
+// Atomically claim ONE oldest PENDING command and mark as RUNNING.
+// If none: return 204 No Content.
+app.post('/commands/next', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Lock one pending row so concurrent workers don't take the same one.
+    const pick = await client.query(
+      `
+      SELECT command_id
+      FROM commands
+      WHERE status = 'PENDING'
+      ORDER BY created_at ASC
+      FOR UPDATE SKIP LOCKED
+      LIMIT 1
+      `
+    );
+
+    if (pick.rows.length === 0) {
+      await client.query('COMMIT');
+      return res.status(204).send();
+    }
+
+    const commandId = pick.rows[0].command_id;
+
+    // Mark as RUNNING
+    await client.query(
+      `
+      UPDATE commands
+      SET status = 'RUNNING',
+          updated_at = NOW()
+      WHERE command_id = $1
+      `,
+      [commandId]
+    );
+
+    // Write an audit log
+    await client.query(
+      `
+      INSERT INTO command_logs (command_id, level, message)
+      VALUES ($1, 'INFO', 'Command claimed by worker')
+      `,
+      [commandId]
+    );
+
+    const claimed = await client.query(
+      'SELECT * FROM commands WHERE command_id = $1',
+      [commandId]
+    );
+
+    await client.query('COMMIT');
+    return res.json(claimed.rows[0]);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('POST /commands/next failed:', err);
+    return res.status(500).json({ error: 'Internal error' });
+  } finally {
+    client.release();
+  }
+});app.get('/commands/:id', async (req, res) => {
+  const { id } = req.params;
+
+  const result = await pool.query(
+    'SELECT * FROM commands WHERE command_id = $1',
+    [id]
+  );
+
+  if (result.rows.length === 0) {
+    return res.status(404).json({ error: 'Not found' });
+  }
+
+  res.json(result.rows[0]);
+});
+
+// --- POST /commands/:id/result ---
+app.post('/commands', async (req, res) => {
+  const { command_id, type, payload } = req.body;
+
+  if (!command_id || !type) {
+    return res.status(400).json({ error: 'command_id and type required' });
+  }
+
+  const newPayload = payload || {};
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    const existing = await client.query(
+      'SELECT * FROM commands WHERE command_id = $1',
+      [command_id]
+    );
+
+    // Case 1: New command
+    if (existing.rows.length === 0) {
+      await client.query(
+        `INSERT INTO commands (command_id, type, payload_json, status)
+         VALUES ($1, $2, $3, 'PENDING')`,
+        [command_id, type, newPayload]
+      );
+
+      const created = await client.query(
+        'SELECT * FROM commands WHERE command_id = $1',
+        [command_id]
+      );
+
+      await client.query('COMMIT');
+      return res.json(created.rows[0]);
+    }
+
+    // Case 2: Existing command → enforce same payload
+    const row = existing.rows[0];
+    const existingPayload = row.payload_json || {};
+
+    const equal =
+      JSON.stringify(existingPayload) === JSON.stringify(newPayload);
+
+    if (!equal) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: 'Payload conflict',
+        message:
+          'This command_id already exists with a different payload. Use a new command_id.'
+      });
+    }
+
+    await client.query('COMMIT');
+    return res.json(row);
+
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    return res.status(500).json({ error: 'Internal error', detail: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log(`A Human API running on port ${PORT}`);
+});
+
